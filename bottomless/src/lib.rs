@@ -151,7 +151,10 @@ pub extern "C" fn xLimit(wal: *mut Wal, limit: i64) {
 
 pub extern "C" fn xBeginReadTransaction(wal: *mut Wal, changed: *mut i32) -> i32 {
     let orig_methods = get_orig_methods(wal);
-    unsafe { (orig_methods.xBeginReadTransaction.unwrap())(wal, changed) }
+    let rc = unsafe { (orig_methods.xBeginReadTransaction.unwrap())(wal, changed) };
+    tracing::debug!("Begin read transaction, changed: {}", unsafe { *changed });
+    unsafe { *changed = 1 }
+    rc
 }
 
 pub extern "C" fn xEndReadTransaction(wal: *mut Wal) {
@@ -160,18 +163,25 @@ pub extern "C" fn xEndReadTransaction(wal: *mut Wal) {
 }
 
 pub extern "C" fn xFindFrame(wal: *mut Wal, pgno: u32, frame: *mut u32) -> i32 {
+    tracing::debug!("Finding frame for page {pgno}");
+    // TODO: return pgno as the frame number
+    // OR, return the newest frame number that holds the page
     let orig_methods = get_orig_methods(wal);
     unsafe { (orig_methods.xFindFrame.unwrap())(wal, pgno, frame) }
 }
 
 pub extern "C" fn xReadFrame(wal: *mut Wal, frame: u32, n_out: i32, p_out: *mut u8) -> i32 {
+    tracing::debug!("Reading frame {frame}");
+    // TODO: read the newest frame from the replicator
     let orig_methods = get_orig_methods(wal);
     unsafe { (orig_methods.xReadFrame.unwrap())(wal, frame, n_out, p_out) }
 }
 
 pub extern "C" fn xDbsize(wal: *mut Wal) -> u32 {
     let orig_methods = get_orig_methods(wal);
-    unsafe { (orig_methods.xDbsize.unwrap())(wal) }
+    let size = unsafe { (orig_methods.xDbsize.unwrap())(wal) };
+    tracing::debug!("DB size: {size}");
+    size
 }
 
 pub extern "C" fn xBeginWriteTransaction(wal: *mut Wal) -> i32 {
@@ -578,6 +588,8 @@ pub mod static_init {
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
             crate::bottomless_init();
+            #[cfg(feature = "init_tracing_statically")]
+            crate::bottomless_tracing_init();
             let orig_methods = unsafe { libsql_wal_methods_find(std::ptr::null()) };
             if orig_methods.is_null() {}
             let methods = crate::bottomless_methods(orig_methods);
