@@ -84,6 +84,7 @@ impl StmtKind {
             Cmd::Stmt(Stmt::AlterTable(tbl_name, _)) => write_if_not_reserved(tbl_name),
             Cmd::Stmt(
                 Stmt::DropIndex { .. }
+                | Stmt::Savepoint(_)
                 | Stmt::CreateTrigger {
                     temporary: false, ..
                 }
