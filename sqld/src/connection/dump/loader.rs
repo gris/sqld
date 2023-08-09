@@ -1,31 +1,31 @@
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use bytes::Bytes;
+use futures_core::{Stream, Future};
 use rusqlite::ErrorCode;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::block_in_place;
+use tokio_util::io::StreamReader;
 
 use crate::connection::libsql::open_db;
 use crate::replication::primary::logger::{ReplicationLoggerHookCtx, REPLICATION_METHODS};
 use crate::replication::ReplicationLogger;
 
-type OpMsg = Box<dyn FnOnce(&rusqlite::Connection) + 'static + Send + Sync>;
+type Op = Box<dyn FnOnce(&rusqlite::Connection) -> Box<dyn Future<Output = ()> + Send + Sync + 'static> + Send + Sync +'static>;
 
 #[derive(Debug)]
 pub struct DumpLoader {
-    sender: mpsc::Sender<OpMsg>,
+    sender: mpsc::Sender<Op>,
 }
 
 impl DumpLoader {
     pub async fn new(
         path: PathBuf,
-        logger: Arc<ReplicationLogger>,
-        bottomless_replicator: Option<Arc<std::sync::Mutex<bottomless::replicator::Replicator>>>,
     ) -> anyhow::Result<Self> {
-        let (sender, mut receiver) = mpsc::channel::<OpMsg>(1);
+        let (sender, mut receiver) = mpsc::channel::<Op>(1);
 
         let (ok_snd, ok_rcv) = oneshot::channel::<anyhow::Result<()>>();
         tokio::task::spawn_blocking(move || {
@@ -71,14 +71,15 @@ impl DumpLoader {
     }
 
     /// Attempts to load the dump at `path` into the database.
-    pub async fn load_dump(&self, path: PathBuf) -> anyhow::Result<()> {
-        tracing::info!("loading dump at `{}`", path.display());
+    pub async fn load_dump<S>(&self, dump: S) -> anyhow::Result<()>
+        where S: Stream<Item = Bytes>
+    {
         let (snd, ret) = oneshot::channel();
         self.sender
-            .send(Box::new(move |conn| {
-                let ret = perform_load_dump(conn, path);
+            .send(Box::new(move |conn| Box::new(async move {
+                let ret = perform_load_dump(conn, dump).await;
                 let _ = snd.send(ret);
-            }))
+            })))
             .await
             .map_err(|_| anyhow!("dump loader channel closed"))?;
 
@@ -93,12 +94,14 @@ impl DumpLoader {
 const WASM_TABLE_CREATE: &str =
     "CREATE TABLE libsql_wasm_func_table (name text PRIMARY KEY, body text) WITHOUT ROWID;";
 
-fn perform_load_dump(conn: &rusqlite::Connection, path: PathBuf) -> anyhow::Result<()> {
-    let mut f = BufReader::new(File::open(path)?);
+async fn perform_load_dump<S>(conn: &rusqlite::Connection, dump: S) -> anyhow::Result<()>
+    where S: Stream<Item = Result<Bytes, std::io::Error>>,
+{
+    let mut reader = tokio::io::BufReader::new(StreamReader::new(dump));
     let mut curr = String::new();
     let mut line = String::new();
     let mut skipped_wasm_table = false;
-    while let Ok(n) = f.read_line(&mut curr) {
+    while let Ok(n) = reader.read_line(&mut curr).await {
         if n == 0 {
             break;
         }
@@ -121,7 +124,7 @@ fn perform_load_dump(conn: &rusqlite::Connection, path: PathBuf) -> anyhow::Resu
         }
 
         if line.ends_with(';') {
-            conn.execute(&line, ())?;
+            block_in_place(|| conn.execute(&line, ()))?;
             line.clear();
         } else {
             line.push(' ');

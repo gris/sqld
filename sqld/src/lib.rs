@@ -454,7 +454,6 @@ async fn start_primary(
         stats: stats.clone(),
         config_store: config_store.clone(),
         max_response_size: config.max_response_size,
-        load_from_dump: None,
         max_total_response_size: config.max_total_response_size,
     };
     let factory = PrimaryNamespaceMaker::new(conf);

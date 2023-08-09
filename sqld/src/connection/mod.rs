@@ -257,6 +257,12 @@ pub struct TrackedConnection<DB> {
     permit: tokio::sync::OwnedSemaphorePermit,
 }
 
+impl<T> TrackedConnection<T> {
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
+}
+
 #[async_trait::async_trait]
 impl<DB: Connection> Connection for TrackedConnection<DB> {
     #[inline]

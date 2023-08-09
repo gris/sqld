@@ -3,16 +3,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::bail;
 use async_lock::{RwLock, RwLockUpgradableReadGuard};
 use bytes::Bytes;
+use futures_core::Stream;
 use hyper::Uri;
+use rusqlite::ErrorCode;
+use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc;
-use tokio::task::JoinSet;
+use tokio::task::{JoinSet, block_in_place};
+use tokio_util::io::StreamReader;
 use tonic::transport::Channel;
 
 use crate::connection::config::DatabaseConfigStore;
-use crate::connection::dump::loader::DumpLoader;
-use crate::connection::libsql::LibSqlDbFactory;
+use crate::connection::libsql::{LibSqlDbFactory, open_db};
 use crate::connection::write_proxy::MakeWriteProxyConnection;
 use crate::connection::MakeConnection;
 use crate::database::{Database, PrimaryDatabase, ReplicaDatabase};
@@ -50,7 +54,7 @@ impl MakeNamespace for PrimaryNamespaceMaker {
     type Database = PrimaryDatabase;
 
     async fn create(&self, name: Bytes) -> anyhow::Result<Namespace<Self::Database>> {
-        Namespace::new_primary(&self.config, name).await
+        Namespace::new_primary(&self.config, name, None).await
     }
 }
 
@@ -219,12 +223,13 @@ pub struct PrimaryNamespaceConfig {
     pub stats: Stats,
     pub config_store: Arc<DatabaseConfigStore>,
     pub max_response_size: u64,
-    pub load_from_dump: Option<PathBuf>,
     pub max_total_response_size: u64,
 }
 
+type DumpStream = Box<dyn Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static + Unpin>;
+
 impl Namespace<PrimaryDatabase> {
-    async fn new_primary(config: &PrimaryNamespaceConfig, name: Bytes) -> anyhow::Result<Self> {
+    async fn new_primary(config: &PrimaryNamespaceConfig, name: Bytes, dump: Option<DumpStream>) -> anyhow::Result<Self> {
         let mut join_set = JoinSet::new();
         let name_str = std::str::from_utf8(&name)?;
         let db_path = config.base_path.join("dbs").join(name_str);
@@ -259,28 +264,24 @@ impl Namespace<PrimaryDatabase> {
 
         join_set.spawn(run_periodic_compactions(logger.clone()));
 
-        // load dump is necessary
-        let dump_loader = DumpLoader::new(
-            db_path.clone(),
-            logger.clone(),
-            bottomless_replicator.clone(),
-        )
-        .await?;
-        if let Some(ref path) = config.load_from_dump {
+        let ctx_builder = {
+            let logger = logger.clone();
+            let bottomless_replicator = bottomless_replicator.clone();
+            move || ReplicationLoggerHookCtx::new(logger.clone(), bottomless_replicator.clone())
+        };
+
+        if let Some(dump) = dump {
             if !is_fresh_db {
                 anyhow::bail!("cannot load from a dump if a database already exists.\nIf you're sure you want to load from a dump, delete your database folder at `{}`", db_path.display());
             }
-            dump_loader.load_dump(path.into()).await?;
+            let mut ctx = ctx_builder();
+            perform_load_dump(&db_path, dump, &mut ctx).await?;
         }
 
         let connection_maker: Arc<_> = LibSqlDbFactory::new(
             db_path.clone(),
             &REPLICATION_METHODS,
-            {
-                let logger = logger.clone();
-                let bottomless_replicator = bottomless_replicator.clone();
-                move || ReplicationLoggerHookCtx::new(logger.clone(), bottomless_replicator.clone())
-            },
+            ctx_builder,
             config.stats.clone(),
             config.config_store.clone(),
             config.extensions.clone(),
@@ -304,4 +305,74 @@ impl Namespace<PrimaryDatabase> {
             path: db_path,
         })
     }
+}
+
+const WASM_TABLE_CREATE: &str =
+    "CREATE TABLE libsql_wasm_func_table (name text PRIMARY KEY, body text) WITHOUT ROWID;";
+
+async fn perform_load_dump<S>(db_path: &Path, dump: S, ctx: &mut ReplicationLoggerHookCtx) -> anyhow::Result<()>
+    where S: Stream<Item = std::io::Result<Bytes>> + Unpin,
+{
+    let mut retries = 0;
+    // there is a small chance we fail to acquire the lock right away, so we perform a few retries
+    let conn = loop {
+        match block_in_place(|| open_db(&db_path, &REPLICATION_METHODS, ctx, None)) {
+            Ok(conn) => {
+                break conn;
+            }
+            // Creating the loader database can, in rare occurences, return sqlite busy,
+            // because of a race condition opening the monitor thread db. This is there to
+            // retry a bunch of times if that happens.
+            Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error {
+                        code: ErrorCode::DatabaseBusy,
+                        ..
+                    },
+                    _,
+            )) if retries < 10 => {
+                retries += 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                bail!(e);
+            }
+        }
+    };
+
+    let mut reader = tokio::io::BufReader::new(StreamReader::new(dump));
+    let mut curr = String::new();
+    let mut line = String::new();
+    let mut skipped_wasm_table = false;
+
+    while let Ok(n) = reader.read_line(&mut curr).await {
+        if n == 0 {
+            break;
+        }
+        let frag = curr.trim();
+
+        if frag.is_empty() || frag.starts_with("--") {
+            curr.clear();
+            continue;
+        }
+
+        line.push_str(frag);
+        curr.clear();
+
+        // This is a hack to ignore the libsql_wasm_func_table table because it is already created
+        // by the system.
+        if !skipped_wasm_table && line == WASM_TABLE_CREATE {
+            skipped_wasm_table = true;
+            line.clear();
+            continue;
+        }
+
+        if line.ends_with(';') {
+            block_in_place(|| conn.execute(&line, ()))?;
+            line.clear();
+        } else {
+            line.push(' ');
+        }
+    }
+
+    Ok(())
 }
