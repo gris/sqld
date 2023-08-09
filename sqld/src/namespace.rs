@@ -34,7 +34,7 @@ use crate::{
 pub trait MakeNamespace: Sync + Send + 'static {
     type Database: Database;
 
-    async fn create(&self, name: Bytes) -> anyhow::Result<Namespace<Self::Database>>;
+    async fn create(&self, name: Bytes, dump: Option<DumpStream>) -> anyhow::Result<Namespace<Self::Database>>;
 }
 
 /// Creates new primary `Namespace`
@@ -53,8 +53,8 @@ impl PrimaryNamespaceMaker {
 impl MakeNamespace for PrimaryNamespaceMaker {
     type Database = PrimaryDatabase;
 
-    async fn create(&self, name: Bytes) -> anyhow::Result<Namespace<Self::Database>> {
-        Namespace::new_primary(&self.config, name, None).await
+    async fn create(&self, name: Bytes, dump: Option<DumpStream>) -> anyhow::Result<Namespace<Self::Database>> {
+        Namespace::new_primary(&self.config, name, dump).await
     }
 }
 
@@ -74,7 +74,11 @@ impl ReplicaNamespaceMaker {
 impl MakeNamespace for ReplicaNamespaceMaker {
     type Database = ReplicaDatabase;
 
-    async fn create(&self, name: Bytes) -> anyhow::Result<Namespace<Self::Database>> {
+    async fn create(&self, name: Bytes, dump: Option<DumpStream>) -> anyhow::Result<Namespace<Self::Database>> {
+        if dump.is_some() {
+            bail!("cannot load dump on replica");
+        }
+
         Namespace::new_replica(&self.config, name).await
     }
 }
@@ -95,7 +99,7 @@ impl NamespaceStore<ReplicaNamespaceMaker> {
             // conccurent hashmap to deal with this issue.
             ns.destroy().await?;
             // re-create the namespace
-            let ns = self.factory.create(namespace.clone()).await?;
+            let ns = self.factory.create(namespace.clone(), None).await?;
             lock.insert(namespace, ns);
         }
 
@@ -120,11 +124,25 @@ impl<F: MakeNamespace> NamespaceStore<F> {
             Ok(f(ns))
         } else {
             let mut lock = RwLockUpgradableReadGuard::upgrade(lock).await;
-            let ns = self.factory.create(namespace.clone()).await?;
+            let ns = self.factory.create(namespace.clone(), None).await?;
             let ret = f(&ns);
             lock.insert(namespace, ns);
             Ok(ret)
         }
+    }
+
+    pub async fn create_with_dump(&self, namespace: Bytes, dump: DumpStream) -> anyhow::Result<()> {
+        let lock = self.inner.upgradable_read().await;
+        if lock.contains_key(&namespace) {
+            bail!("cannot create from dump: the namespace already exists");
+        }
+
+        let ns = self.factory.create(namespace.clone(), Some(dump)).await?;
+
+        let mut lock = RwLockUpgradableReadGuard::upgrade(lock).await;
+        lock.insert(namespace, ns);
+
+        Ok(())
     }
 }
 
@@ -168,8 +186,7 @@ impl Namespace<ReplicaDatabase> {
             db_path.clone(),
             config.channel.clone(),
             config.uri.clone(),
-            name.clone(),
-            &mut join_set,
+            name.clone(), &mut join_set,
             config.hard_reset.clone(),
         )
         .await?;
@@ -274,8 +291,9 @@ impl Namespace<PrimaryDatabase> {
             if !is_fresh_db {
                 anyhow::bail!("cannot load from a dump if a database already exists.\nIf you're sure you want to load from a dump, delete your database folder at `{}`", db_path.display());
             }
+            dbg!();
             let mut ctx = ctx_builder();
-            perform_load_dump(&db_path, dump, &mut ctx).await?;
+            load_dump(&db_path, dump, &mut ctx).await?;
         }
 
         let connection_maker: Arc<_> = LibSqlDbFactory::new(
@@ -310,7 +328,7 @@ impl Namespace<PrimaryDatabase> {
 const WASM_TABLE_CREATE: &str =
     "CREATE TABLE libsql_wasm_func_table (name text PRIMARY KEY, body text) WITHOUT ROWID;";
 
-async fn perform_load_dump<S>(db_path: &Path, dump: S, ctx: &mut ReplicationLoggerHookCtx) -> anyhow::Result<()>
+async fn load_dump<S>(db_path: &Path, dump: S, ctx: &mut ReplicationLoggerHookCtx) -> anyhow::Result<()>
     where S: Stream<Item = std::io::Result<Bytes>> + Unpin,
 {
     let mut retries = 0;

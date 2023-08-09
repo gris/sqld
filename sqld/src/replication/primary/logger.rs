@@ -78,6 +78,8 @@ unsafe impl WalHook for ReplicationLoggerHook {
         let last_valid_frame = wal.hdr.mxFrame;
         let ctx = Self::wal_extract_ctx(wal);
 
+        dbg!();
+
         for (page_no, data) in PageHdrIter::new(page_headers, page_size as _) {
             ctx.write_frame(page_no, data)
         }
@@ -111,6 +113,7 @@ unsafe impl WalHook for ReplicationLoggerHook {
             // do backup after log replication as we don't want to replicate potentially
             // inconsistent frames
             if let Some(replicator) = ctx.bottomless_replicator.as_mut() {
+                dbg!();
                 let mut replicator = replicator.lock().unwrap();
                 replicator.register_last_valid_frame(last_valid_frame);
                 if let Err(e) = replicator.set_page_size(page_size as usize) {

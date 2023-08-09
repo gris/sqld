@@ -197,7 +197,7 @@ where
         join_set.spawn(http::run_http(
             addr,
             auth,
-            namespaces,
+            namespaces.clone(),
             hrana_upgrade_tx,
             hrana_http_srv.clone(),
             config.enable_http_console,
@@ -221,7 +221,7 @@ where
     }
 
     if let Some(addr) = config.admin_addr {
-        join_set.spawn(admin_api::run_admin_api(addr, db_config_store));
+        join_set.spawn(admin_api::run_admin_api(addr, db_config_store, namespaces));
     }
 
     match &config.heartbeat_url {
