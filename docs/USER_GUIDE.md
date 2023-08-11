@@ -229,4 +229,4 @@ For example, if you have the following entries in your `/etc/hosts` file:
 ```
 
 You can access `db1` with the `http://db1.local:8080`URL and `db2` with `http://db2.local:8080`.
-The database files for the databases are stored in `<data dir>/dbs/db1` and `<data dir/dbs/db2`, respectively.
+The database files for the databases are stored in `<data dir>/dbs/db1` and `<data dir>/dbs/db2`, respectively.
