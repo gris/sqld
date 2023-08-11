@@ -1,13 +1,20 @@
+use hyper::Uri;
 use tonic::{transport::Channel, Status};
 
-use super::replication_log::rpc::{Frame, LogOffset, Frames, HelloRequest, HelloResponse};
-use super::replication_log::rpc::replication_log_server::ReplicationLog;
 use super::replication_log::rpc::replication_log_client::ReplicationLogClient;
-
+use super::replication_log::rpc::replication_log_server::ReplicationLog;
+use super::replication_log::rpc::{Frame, Frames, HelloRequest, HelloResponse, LogOffset};
 
 /// A replication log service that proxies request to the primary.
 pub struct ReplicationLogProxyService {
     client: ReplicationLogClient<Channel>,
+}
+
+impl ReplicationLogProxyService {
+    pub fn new(channel: Channel, uri: Uri) -> Self {
+        let client = ReplicationLogClient::with_origin(channel, uri);
+        Self { client }
+    }
 }
 
 #[tonic::async_trait]
